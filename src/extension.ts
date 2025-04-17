@@ -10,7 +10,7 @@ function getDefaultPrompt(): string {
     return "Read the diffs attached and give me a commit message in this form:\n" +
            "modified(*file/path*) to change this and this\n" +
            "You can choose (modified, deleted, added) and the message can be anything like change, fix, add, etc.\n" +
-           "Keep it short and clean and in the same form, keeping the () and a new line between each mod line.";
+           "Keep it short and clean and in the same form, keeping the path inside () and a new line between each mod line.";
 }
 
 

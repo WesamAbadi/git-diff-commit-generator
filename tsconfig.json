@@ -1,0 +1,24 @@
+{
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2022",
+		"outDir": "out",
+		"lib": [
+			"ES2022",
+			"DOM"
+		],
+		"sourceMap": true,
+		"rootDir": "src",
+		"strict": true,   /* enable all strict type-checking options */
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"noUnusedLocals": true,
+		"noImplicitAny": true,
+		"noImplicitThis": true,
+		"moduleResolution": "node16"
+	},
+	"exclude": [
+		"node_modules",
+		".vscode-test"
+	]
+}

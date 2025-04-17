@@ -3,7 +3,7 @@
   "publisher": "WesamAbadi",
   "displayName": "Git Diff Commit Generator",
   "description": "Generate commit messages from git diffs using Gemini AI",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "icon": "resources/icon.gif",
   "engines": {
     "vscode": "^1.99.0"
@@ -75,7 +75,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
-    "@types/vscode": "^1.99.0",
+    "@types/vscode": ">=1.70.0 <1.97.0",
     "@typescript-eslint/eslint-plugin": "^8.28.0",
     "@typescript-eslint/parser": "^8.28.0",
     "@vscode/test-cli": "^0.0.10",

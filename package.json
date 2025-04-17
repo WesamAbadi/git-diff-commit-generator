@@ -1,94 +1,94 @@
 {
-  "name": "git-diff-commit-generator",
-  "publisher": "WesamAbadi",
-  "displayName": "Git Diff Commit Generator",
-  "description": "Generate commit messages from git diffs using Gemini AI",
-  "version": "1.0.5",
-  "icon": "resources/icon.gif",
-  "engines": {
-    "vscode": "^1.99.0"
-  },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onView:gitDiffCommitGeneratorView",
-    "onCommand:git-diff-commit-generator.generateCommitMessage",
-    "onCommand:git-diff-commit-generator.setApiKey"
-  ],
-  "main": "./out/extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "git-diff-commit-generator.generateCommitMessage",
-        "title": "Generate Commit Message"
-      },
-      {
-        "command": "git-diff-commit-generator.setApiKey",
-        "title": "Set Gemini API Key"
-      }
+    "name": "git-diff-commit-generator",
+    "publisher": "WesamAbadi",
+    "displayName": "Git Diff Commit Generator",
+    "description": "Generate commit messages from git diffs using Gemini AI",
+    "version": "1.0.5",
+    "icon": "resources/icon.gif",
+    "engines": {
+        "vscode": "^1.70.0"
+    },
+    "categories": [
+        "Other"
     ],
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "gitDiffCommitGenerator",
-          "title": "Git Diff Commit Generator",
-          "icon": "resources/Kurica.gif"
-        }
-      ]
-    },
-     "views": {
-      "gitDiffCommitGenerator": [
-        {
-          "id": "gitDiffCommitGeneratorView", 
-          "name": "Generator", 
-          "type": "webview"
-        }
-      ]
-    },
-    "configuration": {
-        "title": "Git Diff Commit Generator",
-        "properties": {
-            "gitDiffCommitGenerator.apiKey": {
-                "type": "string",
-                "default": "",
-                "description": "Your Google Gemini API Key.",
-                "scope": "window"
+    "activationEvents": [
+        "onView:gitDiffCommitGeneratorView",
+        "onCommand:git-diff-commit-generator.generateCommitMessage",
+        "onCommand:git-diff-commit-generator.setApiKey"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "git-diff-commit-generator.generateCommitMessage",
+                "title": "Generate Commit Message"
             },
-            "gitDiffCommitGenerator.prompt": {
-                "type": "string",
-                "default": "",
-                "description": "Custom prompt template for generating commit messages. Leave empty to use the default. The diff will be appended.",
-                "scope": "resource"
+            {
+                "command": "git-diff-commit-generator.setApiKey",
+                "title": "Set Gemini API Key"
+            }
+        ],
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "gitDiffCommitGenerator",
+                    "title": "Git Diff Commit Generator",
+                    "icon": "resources/Kurica.gif"
+                }
+            ]
+        },
+        "views": {
+            "gitDiffCommitGenerator": [
+                {
+                    "id": "gitDiffCommitGeneratorView",
+                    "name": "Generator",
+                    "type": "webview"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Git Diff Commit Generator",
+            "properties": {
+                "gitDiffCommitGenerator.apiKey": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Your Google Gemini API Key.",
+                    "scope": "window"
+                },
+                "gitDiffCommitGenerator.prompt": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Custom prompt template for generating commit messages. Leave empty to use the default. The diff will be appended.",
+                    "scope": "resource"
+                }
             }
         }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "pretest": "npm run compile && npm run lint",
+        "lint": "eslint src",
+        "test": "vscode-test"
+    },
+    "devDependencies": {
+        "@types/mocha": "^10.0.6",
+        "@types/node": "18.x",
+        "@types/vscode": "^1.70.0",
+        "@typescript-eslint/eslint-plugin": "^8.28.0",
+        "@typescript-eslint/parser": "^8.28.0",
+        "@vscode/test-cli": "^0.0.10",
+        "@vscode/test-electron": "^2.4.1",
+        "eslint": "^9.23.0",
+        "typescript": "^5.8.2"
+    },
+    "dependencies": {
+        "@google/generative-ai": "^0.24.0",
+        "axios": "^1.8.4"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/WesamAbadi/git-diff-commit-generator"
     }
-  },
-  "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
-    "test": "vscode-test"
-  },
-  "devDependencies": {
-    "@types/mocha": "^10.0.10",
-    "@types/node": "20.x",
-    "@types/vscode": ">=1.70.0 <1.97.0",
-    "@typescript-eslint/eslint-plugin": "^8.28.0",
-    "@typescript-eslint/parser": "^8.28.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.4.1",
-    "eslint": "^9.23.0",
-    "typescript": "^5.8.2"
-  },
-  "dependencies": {
-    "@google/generative-ai": "^0.24.0",
-    "axios": "^1.8.4"
-  },
-  "repository": {
-  "type": "git",
-  "url": "https://github.com/WesamAbadi/git-diff-commit-generator"
-}
 }

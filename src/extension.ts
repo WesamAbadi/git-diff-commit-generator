@@ -1,6 +1,7 @@
 // src/extension.ts (relevant parts)
 import * as vscode from "vscode";
 import * as cp from "child_process";
+import * as path from "path";
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 
 console.log("!!! MODULE LOADED: src/extension.ts !!!"); // Keep this
@@ -13,6 +14,9 @@ function getDefaultPrompt(): string {
            "Keep it short and clean and in the same form, keeping the path inside () and a new line between each mod line.";
 }
 
+// Store commit message history
+const commitMessageHistory: string[] = [];
+const MAX_HISTORY_SIZE = 10;
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("Activating git-diff-commit-generator...");
@@ -21,22 +25,17 @@ export function activate(context: vscode.ExtensionContext) {
   // Register the main command
   let generateCommand = vscode.commands.registerCommand(
     "git-diff-commit-generator.generateCommitMessage",
-    async () => {
-        console.log("Command: generateCommitMessage triggered");
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        if (!workspaceFolder) {
-            vscode.window.showErrorMessage("No workspace folder found");
-            return;
-        }
-
+    async (context) => {
+        console.log("Command: generateCommitMessage triggered", context);
+        
         try {
             const config = vscode.workspace.getConfiguration("gitDiffCommitGenerator");
             const apiKey = config.get<string>("apiKey");
+            const alwaysUseGeneratedMessage = config.get<boolean>("alwaysUseGeneratedMessage") || false;
+            const selectedModel = config.get<string>("selectedModel") || "gemini-2.0-flash";
 
             if (!apiKey) {
                 vscode.window.showWarningMessage("Gemini API key not set. Please set it first via the sidebar or the command palette.");
-                // Optionally focus the view:
-                // vscode.commands.executeCommand('gitDiffCommitGeneratorView.focus');
                 return;
             }
 
@@ -44,16 +43,78 @@ export function activate(context: vscode.ExtensionContext) {
                 {
                     location: vscode.ProgressLocation.Notification,
                     title: "Generating commit message",
-                    cancellable: false, // Consider making cancellable later
+                    cancellable: false,
                 },
                 async (progress) => {
+                    // Check if we have a repository from context (SCM view)
+                    let selectedRepo: { path: string, name: string, workspaceFolder: vscode.WorkspaceFolder } | undefined;
+                    
+                    // Get the git extension
+                    const gitExtension = vscode.extensions.getExtension("vscode.git")?.exports;
+                    const api = gitExtension?.getAPI(1);
+                    
+                    // If called from SCM view, try to get the active repository
+                    if (api && api.repositories.length > 0) {
+                        const activeRepo = api.repositories.find((r: any) => r.ui.selected);
+                        
+                        if (activeRepo) {
+                            // We found the active repository from SCM
+                            const repoPath = activeRepo.rootUri.fsPath;
+                            const workspaceFolder = vscode.workspace.workspaceFolders?.find(
+                                folder => repoPath.startsWith(folder.uri.fsPath)
+                            );
+                            
+                            if (workspaceFolder) {
+                                selectedRepo = {
+                                    path: repoPath,
+                                    name: workspaceFolder.name + (repoPath === workspaceFolder.uri.fsPath ? '' : 
+                                        '/' + path.relative(workspaceFolder.uri.fsPath, repoPath)),
+                                    workspaceFolder: workspaceFolder
+                                };
+                            }
+                        }
+                    }
+                    
+                    // If we don't have a selected repo yet, get all repos and prompt user
+                    if (!selectedRepo) {
+                        progress.report({ message: "Finding git repositories..." });
+                        const repositories = await getGitRepositories();
+                        
+                        if (repositories.length === 0) {
+                            vscode.window.showErrorMessage("No git repositories found in workspace");
+                            return;
+                        }
+                        
+                        if (repositories.length > 1) {
+                            const repoItems = repositories.map(repo => ({
+                                label: repo.name,
+                                description: repo.path,
+                                repo: repo
+                            }));
+                            
+                            const selection = await vscode.window.showQuickPick(repoItems, {
+                                placeHolder: 'Select a git repository',
+                            });
+                            
+                            if (!selection) {
+                                return; // User cancelled
+                            }
+                            selectedRepo = selection.repo;
+                        } else {
+                            selectedRepo = repositories[0];
+                        }
+                    }
+
+                    if (!selectedRepo) {
+                        return;
+                    }
+
                     progress.report({ message: "Getting staged changes..." });
                     console.log("Getting staged diff...");
 
-                    const stagedDiff = await getStagedDiff(workspaceFolder.uri.fsPath);
-                    if (!stagedDiff && stagedDiff !== "") { // Handle potential error from getStagedDiff if it rejects
-                       // Error was already shown by getStagedDiff or caught below
-                       return;
+                    const stagedDiff = await getStagedDiff(selectedRepo.path);
+                    if (!stagedDiff && stagedDiff !== "") {
+                        return;
                     }
                     if (stagedDiff === "") {
                         vscode.window.showInformationMessage("No staged changes found.");
@@ -66,52 +127,91 @@ export function activate(context: vscode.ExtensionContext) {
                     const promptTemplate = config.get<string>("prompt") || getDefaultPrompt();
 
                     console.log("Calling Gemini API...");
-                    const commitMessage = await generateCommitMessage(apiKey, promptTemplate, stagedDiff);
+                    const commitMessage = await generateCommitMessage(apiKey, promptTemplate, stagedDiff, selectedModel);
 
                     if (commitMessage) {
                         console.log("Commit message generated:", commitMessage);
-                        const selection = await vscode.window.showInformationMessage(
-                            "Generated commit message:",
-                            { modal: true, detail: commitMessage },
-                            "Use This Message",
-                            "Copy to Clipboard",
-                            "Cancel"
-                        );
-
-                        if (selection === "Use This Message") {
+                        
+                        // Add to history
+                        if (!commitMessageHistory.includes(commitMessage)) {
+                            commitMessageHistory.unshift(commitMessage);
+                            if (commitMessageHistory.length > MAX_HISTORY_SIZE) {
+                                commitMessageHistory.pop();
+                            }
+                        }
+                        
+                        provider.clearGeneratingStatus();
+                        
+                        if (alwaysUseGeneratedMessage) {
                             const gitExtension = vscode.extensions.getExtension("vscode.git")?.exports;
                             const api = gitExtension?.getAPI(1);
                             if (api && api.repositories.length > 0) {
-                                // Use the first repository found
-                                api.repositories[0].inputBox.value = commitMessage;
-                                vscode.window.showInformationMessage("Commit message applied to Git input box.");
-                                console.log("Applied commit message to Git input.");
+                                // Find the correct repository
+                                const repo = api.repositories.find((r: { rootUri: { fsPath: string } }) => {
+                                    const path = r.rootUri.fsPath;
+                                    return path === selectedRepo?.path;
+                                });
+                                
+                                if (repo) {
+                                    repo.inputBox.value = commitMessage;
+                                    vscode.window.showInformationMessage("Commit message applied to Git input box.");
+                                } else {
+                                    await vscode.env.clipboard.writeText(commitMessage);
+                                    vscode.window.showWarningMessage("Commit message copied to clipboard (Git repository not found).");
+                                }
                             } else {
                                 await vscode.env.clipboard.writeText(commitMessage);
-                                vscode.window.showWarningMessage("Commit message copied to clipboard (Git extension/repository not readily available).");
-                                console.log("Copied commit message (Git API not found/ready).");
+                                vscode.window.showWarningMessage("Commit message copied to clipboard (Git extension not available).");
                             }
-                        } else if (selection === "Copy to Clipboard") {
-                            await vscode.env.clipboard.writeText(commitMessage);
-                            vscode.window.showInformationMessage("Commit message copied to clipboard.");
-                            console.log("Copied commit message to clipboard.");
                         } else {
-                           console.log("User cancelled using generated message.");
+                            const selection = await vscode.window.showInformationMessage(
+                                "Generated commit message:",
+                                { modal: true, detail: commitMessage },
+                                "Use This Message",
+                                "Copy to Clipboard",
+                                "Cancel"
+                            );
+
+                            if (selection === "Use This Message") {
+                                const gitExtension = vscode.extensions.getExtension("vscode.git")?.exports;
+                                const api = gitExtension?.getAPI(1);
+                                if (api && api.repositories.length > 0) {
+                                    // Find the correct repository
+                                    const repo = api.repositories.find((r: { rootUri: { fsPath: string } }) => {
+                                        const path = r.rootUri.fsPath;
+                                        return path === selectedRepo?.path;
+                                    });
+                                    
+                                    if (repo) {
+                                        repo.inputBox.value = commitMessage;
+                                        vscode.window.showInformationMessage("Commit message applied to Git input box.");
+                                    } else {
+                                        await vscode.env.clipboard.writeText(commitMessage);
+                                        vscode.window.showWarningMessage("Commit message copied to clipboard (Git repository not found).");
+                                    }
+                                } else {
+                                    await vscode.env.clipboard.writeText(commitMessage);
+                                    vscode.window.showWarningMessage("Commit message copied to clipboard (Git extension not available).");
+                                }
+                            } else if (selection === "Copy to Clipboard") {
+                                await vscode.env.clipboard.writeText(commitMessage);
+                                vscode.window.showInformationMessage("Commit message copied to clipboard.");
+                            }
                         }
                     } else {
-                        // generateCommitMessage should throw an error if it fails,
-                        // but handle the case where it might return empty/null unexpectedly
                         console.log("Generation resulted in empty message.");
+                        provider.clearGeneratingStatus();
                         vscode.window.showWarningMessage("Failed to generate commit message (empty response).");
                     }
-                } // Progress scope ends
-            ); // withProgress ends
+                }
+            );
         } catch (error: any) {
             console.error(`Error in generateCommitMessage command:`, error);
+            provider.clearGeneratingStatus();
             vscode.window.showErrorMessage(`Error generating commit message: ${error.message}`);
         }
-    } // Command handler ends
-  ); // registerCommand ends
+    }
+  );
 
   // Register the API key setting command
   let setApiKeyCommand = vscode.commands.registerCommand(
@@ -148,6 +248,55 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  // Register command to show commit message history
+  let showHistoryCommand = vscode.commands.registerCommand(
+    "git-diff-commit-generator.showCommitHistory",
+    async () => {
+        if (commitMessageHistory.length === 0) {
+            vscode.window.showInformationMessage("No commit message history available.");
+            return;
+        }
+
+        const items = commitMessageHistory.map((message, index) => {
+            // Create a shortened preview of the message
+            const preview = message.length > 50 ? 
+                message.substring(0, 47) + "..." : 
+                message;
+            
+            return {
+                label: `${index + 1}. ${preview}`,
+                description: new Date().toLocaleString(), // Could store timestamps with messages for better info
+                message: message
+            };
+        });
+
+        const selection = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Select a previous commit message',
+        });
+
+        if (selection) {
+            // Get the git extension
+            const gitExtension = vscode.extensions.getExtension("vscode.git")?.exports;
+            const api = gitExtension?.getAPI(1);
+            
+            if (api && api.repositories.length > 0) {
+                const activeRepo = api.repositories.find((r: any) => r.ui.selected);
+                
+                if (activeRepo) {
+                    activeRepo.inputBox.value = selection.message;
+                    vscode.window.showInformationMessage("Previous commit message applied.");
+                } else {
+                    await vscode.env.clipboard.writeText(selection.message);
+                    vscode.window.showInformationMessage("Previous commit message copied to clipboard.");
+                }
+            } else {
+                await vscode.env.clipboard.writeText(selection.message);
+                vscode.window.showInformationMessage("Previous commit message copied to clipboard.");
+            }
+        }
+    }
+  );
+
   // Create and register the sidebar provider
   const provider = new CommitMessageViewProvider(context.extensionUri, context);
   console.log("Registering WebviewViewProvider for gitDiffCommitGeneratorView...");
@@ -168,20 +317,84 @@ export function activate(context: vscode.ExtensionContext) {
   console.log("Pushing commands to subscriptions...");
   context.subscriptions.push(generateCommand);
   context.subscriptions.push(setApiKeyCommand);
+  context.subscriptions.push(showHistoryCommand);
   console.log("Commands pushed.");
 
   console.log("ACTIVATE END");
 } // activate function ends
 
-// --- getStagedDiff Function ---
-async function getStagedDiff(workspacePath: string): Promise<string> {
-    console.log(`Executing 'git diff --cached' in ${workspacePath}`);
+async function getGitRepositories(): Promise<Array<{ path: string, name: string, workspaceFolder: vscode.WorkspaceFolder }>> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+        return [];
+    }
+
+    const repositories: Array<{ path: string, name: string, workspaceFolder: vscode.WorkspaceFolder }> = [];
+
+    for (const folder of workspaceFolders) {
+        // First check if the workspace folder itself is a git repo
+        try {
+            await new Promise((resolve, reject) => {
+                cp.exec("git rev-parse --git-dir", { cwd: folder.uri.fsPath }, (error, stdout, stderr) => {
+                    if (!error) {
+                        repositories.push({
+                            path: folder.uri.fsPath,
+                            name: folder.name,
+                            workspaceFolder: folder
+                        });
+                    }
+                    resolve(null);
+                });
+            });
+        } catch (error) {
+            console.log(`Not a git repository at root: ${folder.uri.fsPath}`);
+        }
+
+        // Then look for git repositories in subdirectories
+        try {
+            const result = await new Promise<string>((resolve, reject) => {
+                cp.exec("find . -name .git -type d", { cwd: folder.uri.fsPath }, (error, stdout, stderr) => {
+                    if (error) {
+                        resolve('');
+                        return;
+                    }
+                    resolve(stdout);
+                });
+            });
+
+            const subRepos = result.trim().split('\n')
+                .filter(path => path) // Remove empty strings
+                .map(path => path.replace('/.git', '')) // Remove .git from path
+                .map(path => path.replace('./', '')); // Remove leading ./
+
+            for (const subPath of subRepos) {
+                const fullPath = path.join(folder.uri.fsPath, subPath);
+                // Don't add if we already have this repository
+                if (!repositories.some(repo => repo.path === fullPath)) {
+                    repositories.push({
+                        path: fullPath,
+                        name: `${folder.name}/${subPath}`,
+                        workspaceFolder: folder
+                    });
+                }
+            }
+        } catch (error) {
+            console.error(`Error finding git repositories in ${folder.uri.fsPath}:`, error);
+        }
+    }
+
+    return repositories;
+}
+
+async function getStagedDiff(workspacePath: string, subPath?: string): Promise<string> {
+    console.log(`Executing 'git diff --cached' in ${workspacePath}${subPath ? '/' + subPath : ''}`);
+    const execPath = subPath ? `${workspacePath}/${subPath}` : workspacePath;
+    
     return new Promise((resolve, reject) => {
-        cp.exec("git diff --cached", { cwd: workspacePath, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+        cp.exec("git diff --cached", { cwd: execPath, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
             if (error) {
                 console.error(`Git diff error: ${error.message}`);
                 console.error(`Git diff stderr: ${stderr}`);
-                // Try to provide a more user-friendly error
                 if (stderr.includes("not a git repository")) {
                    reject(new Error("Not a git repository or no HEAD commit yet."));
                 } else {
@@ -202,11 +415,11 @@ async function getStagedDiff(workspacePath: string): Promise<string> {
 }
 
 // --- generateCommitMessage Function ---
-async function generateCommitMessage(apiKey: string, prompt: string, diff: string): Promise<string> {
+async function generateCommitMessage(apiKey: string, prompt: string, diff: string, selectedModel: string): Promise<string> {
     console.log("Initializing Gemini AI client...");
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const model = genAI.getGenerativeModel({ model: selectedModel });
 
         const fullPrompt = `${prompt}\n\nHere are the diffs:\n\`\`\`diff\n${diff}\n\`\`\``;
         console.log(`Sending prompt to Gemini (Prompt length: ${prompt.length}, Diff length: ${diff.length})`);
@@ -316,7 +529,7 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                         vscode.commands.executeCommand('git-diff-commit-generator.generateCommitMessage');
                         break;
                     case 'setPrompt':
-                         if (typeof data.value === 'string') {
+                        if (typeof data.value === 'string') {
                             console.log("Saving prompt template...");
                             const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
                             try {
@@ -324,19 +537,69 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                                 vscode.window.showInformationMessage('Prompt template saved.');
                                 console.log("Prompt template saved successfully.");
                             } catch (error: any) {
-                                 console.error("Error saving prompt template:", error);
-                                 vscode.window.showErrorMessage(`Failed to save prompt: ${error.message}`);
+                                console.error("Error saving prompt template:", error);
+                                vscode.window.showErrorMessage(`Failed to save prompt: ${error.message}`);
                             }
-                         } else {
+                        } else {
                             console.warn("Received 'setPrompt' command without valid string value.");
-                         }
+                        }
                         break;
-                    case 'getInitialSettings': // Handle request from webview script
-                         console.log("Webview requested initial settings. Posting current settings...");
-                         this._updateWebviewSettings();
-                         break;
+                    case 'setModel':
+                        if (typeof data.value === 'string') {
+                            console.log("Saving model selection...");
+                            const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
+                            try {
+                                await config.update('selectedModel', data.value, vscode.ConfigurationTarget.Global);
+                                console.log("Model selection saved successfully.");
+                            } catch (error: any) {
+                                console.error("Error saving model selection:", error);
+                                vscode.window.showErrorMessage(`Failed to save model selection: ${error.message}`);
+                            }
+                        }
+                        break;
+                    case 'setAlwaysUseGenerated':
+                        if (typeof data.value === 'boolean') {
+                            console.log("Saving always use generated setting...");
+                            const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
+                            try {
+                                await config.update('alwaysUseGeneratedMessage', data.value, vscode.ConfigurationTarget.Global);
+                                console.log("Always use generated setting saved successfully.");
+                            } catch (error: any) {
+                                console.error("Error saving always use generated setting:", error);
+                                vscode.window.showErrorMessage(`Failed to save setting: ${error.message}`);
+                            }
+                        }
+                        break;
+                    case 'newTemplate':
+                        this._createNewTemplate();
+                        break;
+                    case 'editTemplate':
+                        if (typeof data.value === 'string') {
+                            this._editTemplate(data.value);
+                        }
+                        break;
+                    case 'deleteTemplate':
+                        if (typeof data.value === 'string') {
+                            this._deleteTemplate(data.value);
+                        }
+                        break;
+                    case 'getInitialSettings':
+                        console.log("Webview requested initial settings. Posting current settings...");
+                        this._updateWebviewSettings();
+                        break;
+                    case 'showCommitHistory':
+                        vscode.commands.executeCommand('git-diff-commit-generator.showCommitHistory');
+                        break;
+                    case 'copyLastCommitMessage':
+                        if (commitMessageHistory.length > 0) {
+                            await vscode.env.clipboard.writeText(commitMessageHistory[0]);
+                            vscode.window.showInformationMessage("Last commit message copied to clipboard.");
+                        } else {
+                            vscode.window.showInformationMessage("No commit message history available.");
+                        }
+                        break;
                     default:
-                         console.warn(`Received unknown command from webview: ${data.command}`);
+                        console.warn(`Received unknown command from webview: ${data.command}`);
                 }
             });
             console.log("-> Webview message listener added.");
@@ -378,7 +641,7 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
     }
 
     // Helper method to send current settings to the webview
-    private _updateWebviewSettings() {
+    private async _updateWebviewSettings() {
         if (!this._view) {
             console.warn("Attempted to update webview settings, but view is not available.");
             return;
@@ -387,35 +650,37 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
         const config = vscode.workspace.getConfiguration("gitDiffCommitGenerator");
         const apiKey = config.get<string>("apiKey");
         const prompt = config.get<string>("prompt") || getDefaultPrompt();
+        const selectedModel = config.get<string>("selectedModel") || "gemini-2.0-flash";
+        const alwaysUseGenerated = config.get<boolean>("alwaysUseGeneratedMessage") || false;
+        const savedTemplates = config.get<{ [key: string]: any }>("savedTemplates") || {};
+        const defaultTemplateId = config.get<string>("defaultTemplateId") || "";
 
-        console.log(`--> Posting 'updateSettings': hasApiKey=${!!apiKey}`); // Log before posting
+        console.log(`--> Posting 'updateSettings': hasApiKey=${!!apiKey}`);
         this._view.webview.postMessage({
             command: "updateSettings",
             hasApiKey: !!apiKey,
             prompt: prompt,
+            selectedModel: selectedModel,
+            alwaysUseGenerated: alwaysUseGenerated,
+            templates: savedTemplates,
+            selectedTemplateId: defaultTemplateId,
+            hasHistory: commitMessageHistory.length > 0
         }).then(
-             (success) => { if (!success) console.warn("--> postMessage 'updateSettings' returned false."); }, // Log if postMessage fails
-             (error) => { console.error("--> postMessage 'updateSettings' FAILED:", error); }
-         );
+            (success) => { if (!success) console.warn("--> postMessage 'updateSettings' returned false."); },
+            (error) => { console.error("--> postMessage 'updateSettings' FAILED:", error); }
+        );
     }
 
     // Generates the HTML content for the webview
     private _getHtmlForWebview(webview: vscode.Webview): string {
         console.log("Generating HTML content for webview...");
-        // Get URIs for local resources
-        // const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'main.js')); // Example if using separate JS
-        // const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'styles.css')); // Example if using separate CSS
-
-        // Use a nonce for inline scripts/styles (more secure)
         const nonce = getNonce();
-
-        // Note: Using inline styles/scripts for simplicity here, but external files are better practice
+        
         const htmlContent = `<!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <!-- Set Content Security Policy -->
             <meta http-equiv="Content-Security-Policy" content="
                 default-src 'none';
                 style-src ${webview.cspSource} 'unsafe-inline';
@@ -427,93 +692,127 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
             <style>
                 /* Basic Reset & Variables */
                 :root {
-                    --button-padding: 8px 12px;
-                    --section-padding: 15px;
-                    --gap: 10px;
+                    --button-padding: 6px 10px;
+                    --section-padding: 10px;
+                    --gap: 8px;
+                    --border-radius: 4px;
+                    --transition: all 0.2s ease;
                 }
                 body {
                     font-family: var(--vscode-font-family);
                     font-size: var(--vscode-font-size);
                     color: var(--vscode-foreground);
-                    background-color: var(--vscode-sideBar-background); /* Match sidebar */
-                    padding: var(--section-padding);
+                    background-color: var(--vscode-sideBar-background);
+                    padding: 8px;
                     box-sizing: border-box;
                     height: 100vh;
                     display: flex;
                     flex-direction: column;
+                    margin: 0;
                 }
                 *, *::before, *::after {
                     box-sizing: inherit;
+                    margin: 0;
+                    padding: 0;
                 }
 
                 /* Layout */
                 .container {
                     display: flex;
                     flex-direction: column;
-                    gap: calc(var(--gap) * 1.5);
-                    flex-grow: 1; /* Allow container to fill space */
+                    gap: 8px;
+                    flex-grow: 1;
                 }
                 .section {
-                    background-color: var(--vscode-editorWidget-background, var(--vscode-sideBar-background)); /* Use widget background if available */
+                    background-color: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
                     padding: var(--section-padding);
-                    border-radius: 6px;
+                    border-radius: var(--border-radius);
                     border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border));
+                    overflow: hidden;
                 }
-                .action-container {
+                .section-header {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    margin-bottom: 6px;
+                    cursor: pointer;
+                }
+                .section-header h3 {
+                    display: flex;
+                    align-items: center;
+                    font-size: 0.9em;
+                    font-weight: 600;
+                    color: var(--vscode-sideBarTitle-foreground);
+                    margin: 0;
+                    border: none;
+                    padding: 0;
+                }
+                .section-header h3 span {
+                    margin-left: 4px;
+                }
+                .section-content {
                     display: flex;
                     flex-direction: column;
                     gap: var(--gap);
-                    margin-top: var(--gap);
+                }
+                .collapsed .section-content {
+                    display: none;
+                }
+                .section-icon {
+                    font-size: 0.8em;
+                    transition: var(--transition);
+                }
+                .collapsed .section-icon {
+                    transform: rotate(-90deg);
+                }
+                .emoji-icon {
+                    margin-right: 4px;
                 }
 
                 /* Elements */
-                h3 {
-                    margin-top: 0;
-                    margin-bottom: var(--gap);
-                    font-size: 1.1em; /* Slightly larger */
-                    font-weight: 600;
-                    color: var(--vscode-sideBarTitle-foreground); /* Match title color */
-                    border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border));
-                    padding-bottom: 5px;
-                }
                 button {
                     background-color: var(--vscode-button-background);
                     color: var(--vscode-button-foreground);
-                    border: 1px solid var(--vscode-button-border, transparent);
+                    border: none;
                     padding: var(--button-padding);
                     cursor: pointer;
-                    border-radius: 4px;
+                    border-radius: var(--border-radius);
+                    font-size: 0.9em;
                     font-weight: 500;
-                    transition: background-color 0.2s ease-in-out, border-color 0.2s ease-in-out;
+                    transition: var(--transition);
                     width: 100%;
                     text-align: center;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 6px;
                 }
                 button:hover {
                     background-color: var(--vscode-button-hoverBackground);
                 }
                 button:focus {
                     outline: 1px solid var(--vscode-focusBorder);
-                    outline-offset: 2px;
+                    outline-offset: 1px;
                 }
                 button:disabled {
                     background-color: var(--vscode-button-secondaryBackground, var(--vscode-disabledForeground));
                     color: var(--vscode-disabledForeground);
                     cursor: not-allowed;
                     opacity: 0.7;
-                    border-color: transparent;
                 }
                 textarea {
                     width: 100%;
-                    min-height: 100px; /* Adjust as needed */
-                    max-height: 300px; /* Prevent excessive height */
+                    min-height: 80px;
+                    max-height: 200px;
                     background-color: var(--vscode-input-background);
                     color: var(--vscode-input-foreground);
                     border: 1px solid var(--vscode-input-border);
-                    border-radius: 4px;
-                    padding: 8px;
+                    border-radius: var(--border-radius);
+                    padding: 6px;
                     font-family: var(--vscode-editor-font-family);
                     font-size: var(--vscode-editor-font-size);
-                    resize: vertical; /* Allow vertical resize */
+                    resize: vertical;
+                    transition: var(--transition);
                 }
                 textarea:focus {
                     outline: 1px solid var(--vscode-focusBorder);
@@ -525,15 +824,14 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                     display: flex;
                     align-items: center;
                     gap: 6px;
-                    margin-bottom: var(--gap);
-                    font-size: 0.9em;
+                    margin-bottom: 6px;
+                    font-size: 0.85em;
                 }
                 .api-status-icon {
-                    width: 10px;
-                    height: 10px;
+                    width: 8px;
+                    height: 8px;
                     border-radius: 50%;
-                    flex-shrink: 0; /* Prevent icon from shrinking */
-                    border: 1px solid var(--vscode-contrastBorder, transparent);
+                    flex-shrink: 0;
                 }
                 .api-status-icon.set {
                     background-color: var(--vscode-testing-iconPassed, green);
@@ -542,44 +840,166 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                     background-color: var(--vscode-errorForeground, red);
                 }
                 #apiKeyStatusText {
-                     color: var(--vscode-descriptionForeground);
+                    color: var(--vscode-descriptionForeground);
+                }
+
+                /* Model selection and options */
+                select {
+                    width: 100%;
+                    padding: 6px;
+                    background-color: var(--vscode-input-background);
+                    color: var(--vscode-input-foreground);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: var(--border-radius);
+                    font-size: 0.9em;
+                    transition: var(--transition);
+                }
+                select:focus {
+                    outline: 1px solid var(--vscode-focusBorder);
+                    border-color: var(--vscode-focusBorder);
+                }
+                .checkbox-container {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    font-size: 0.85em;
+                }
+                .checkbox-container input[type="checkbox"] {
+                    margin: 0;
+                }
+
+                /* Template list */
+                .template-list {
+                    max-height: 150px;
+                    overflow-y: auto;
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: var(--border-radius);
+                    margin-bottom: 6px;
+                    font-size: 0.9em;
+                }
+                .template-item {
+                    padding: 6px 8px;
+                    border-bottom: 1px solid var(--vscode-input-border);
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    transition: var(--transition);
+                }
+                .template-item:last-child {
+                    border-bottom: none;
+                }
+                .template-item:hover {
+                    background-color: var(--vscode-list-hoverBackground);
+                }
+                .template-item.selected {
+                    background-color: var(--vscode-list-activeSelectionBackground);
+                    color: var(--vscode-list-activeSelectionForeground);
+                }
+                .template-name {
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    flex: 1;
+                }
+                .template-actions {
+                    display: flex;
+                    gap: 4px;
+                }
+                .template-actions button {
+                    padding: 2px 6px;
+                    font-size: 0.8em;
+                    min-width: 40px;
+                }
+                .button-row {
+                    display: flex;
+                    gap: 6px;
+                }
+                .button-row button {
+                    flex: 1;
+                }
+                .small-text {
+                    font-size: 0.8em;
+                    color: var(--vscode-descriptionForeground);
+                    margin-top: 4px;
+                }
+                #generateStatus {
+                    font-size: 0.8em;
+                    text-align: center;
+                    min-height: 1.2em;
+                    margin-top: 4px;
                 }
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="section">
-                    <h3>API Key</h3>
-                    <div class="api-key-status">
-                        <div id="apiKeyStatus" class="api-status-icon not-set"></div>
-                        <span id="apiKeyStatusText">Checking...</span>
+                    <div class="section-header" id="apiKeyHeader">
+                        <h3><span class="emoji-icon">🔑</span> <span>API Key</span></h3>
+                        <span class="section-icon">▼</span>
                     </div>
-                    <div class="action-container" style="margin-top: 0;"> <!-- Reduced margin -->
-                        <button id="setApiKeyBtn">Set/Update Gemini API Key</button>
-                    </div>
-                </div>
-
-                <div class="section">
-                    <h3>Generate</h3>
-                    <div class="action-container">
-                        <button id="generateBtn" disabled>Generate from Staged Changes</button>
-                        <small id="generateStatus" style="color: var(--vscode-descriptionForeground); text-align: center;"></small>
+                    <div class="section-content">
+                        <div class="api-key-status">
+                            <div id="apiKeyStatus" class="api-status-icon not-set"></div>
+                            <span id="apiKeyStatusText">Checking...</span>
+                        </div>
+                        <button id="setApiKeyBtn"><span class="emoji-icon">✏️</span> Set/Update API Key</button>
                     </div>
                 </div>
 
                 <div class="section">
-                    <h3>Prompt Template</h3>
-                    <textarea id="promptTemplate" placeholder="Enter your custom prompt template... (Uses default if empty)"></textarea>
-                    <div class="action-container">
-                        <button id="savePromptBtn">Save Prompt Template</button>
+                    <div class="section-header" id="modelHeader">
+                        <h3><span class="emoji-icon">⚙️</span> <span>Settings</span></h3>
+                        <span class="section-icon">▼</span>
+                    </div>
+                    <div class="section-content">
+                        <select id="modelSelect" title="Select which Gemini model to use">
+                            <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                            <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite</option>
+                            <option value="gemini-2.5-flash-preview-05-20">Gemini 2.5 Flash Preview</option>
+                            <option value="gemini-2.5-pro-preview-05-06">Gemini 2.5 Pro</option>
+                        </select>
+                        <div class="checkbox-container">
+                            <input type="checkbox" id="alwaysUseGenerated" />
+                            <label for="alwaysUseGenerated">Always use generated message</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">
+                        <h3><span class="emoji-icon">✨</span> <span>Generate</span></h3>
+                    </div>
+                    <div class="section-content">
+                        <button id="generateBtn" disabled><span class="emoji-icon">✨</span> Generate Commit Message</button>
+                        <div class="button-row" style="margin-top: 6px;">
+                            <button id="historyBtn"><span class="emoji-icon">🕒</span> History</button>
+                            <button id="copyBtn"><span class="emoji-icon">📋</span> Copy Last</button>
+                        </div>
+                        <div id="generateStatus"></div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header" id="templatesHeader">
+                        <h3><span class="emoji-icon">📚</span> <span>Templates</span></h3>
+                        <span class="section-icon">▼</span>
+                    </div>
+                    <div class="section-content">
+                        <div class="template-list" id="templateList">
+                            <!-- Templates will be populated here -->
+                        </div>
+                        <div class="button-row">
+                            <button id="newTemplateBtn"><span class="emoji-icon">➕</span> New</button>
+                            <button id="editTemplateBtn"><span class="emoji-icon">✏️</span> Edit</button>
+                        </div>
+                        <textarea id="promptTemplate" placeholder="Enter your custom prompt template..."></textarea>
+                        <button id="savePromptBtn"><span class="emoji-icon">💾</span> Save Template</button>
                     </div>
                 </div>
             </div>
 
             <script nonce="${nonce}">
-                // Wrap in IIFE to avoid polluting global scope
                 (function() {
-                    // Check if acquireVsCodeApi exists (robustness)
                     if (typeof acquireVsCodeApi === 'function') {
                         const vscode = acquireVsCodeApi();
 
@@ -590,18 +1010,42 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                         const generateBtn = document.getElementById('generateBtn');
                         const promptTemplate = document.getElementById('promptTemplate');
                         const savePromptBtn = document.getElementById('savePromptBtn');
-                        const generateStatus = document.getElementById('generateStatus'); // For feedback
+                        const generateStatus = document.getElementById('generateStatus');
+                        const modelSelect = document.getElementById('modelSelect');
+                        const alwaysUseGenerated = document.getElementById('alwaysUseGenerated');
+                        const templateList = document.getElementById('templateList');
+                        const newTemplateBtn = document.getElementById('newTemplateBtn');
+                        const editTemplateBtn = document.getElementById('editTemplateBtn');
+                        const historyBtn = document.getElementById('historyBtn');
+                        const copyBtn = document.getElementById('copyBtn');
+                        
+                        // Section headers for collapsible sections
+                        const apiKeyHeader = document.getElementById('apiKeyHeader');
+                        const modelHeader = document.getElementById('modelHeader');
+                        const templatesHeader = document.getElementById('templatesHeader');
 
                         // --- State ---
                         let currentApiKeySet = false;
-                        // Store previous state to avoid unnecessary updates
-                        const previousState = vscode.getState() || { hasApiKey: false, prompt: '' };
+                        let currentTemplates = {};
+                        let selectedTemplateId = null;
+                        const previousState = vscode.getState() || { 
+                            hasApiKey: false, 
+                            prompt: '',
+                            selectedModel: 'gemini-2.0-flash',
+                            alwaysUseGenerated: false,
+                            templates: {},
+                            selectedTemplateId: null,
+                            collapsedSections: {
+                                apiKey: false,
+                                model: false,
+                                templates: false
+                            }
+                        };
                         console.log('Initial webview state:', previousState);
-
 
                         // --- Functions ---
                         function updateApiKeyStatus(hasApiKey) {
-                            currentApiKeySet = hasApiKey; // Update internal state tracker
+                            currentApiKeySet = hasApiKey;
                             if (hasApiKey) {
                                 apiKeyStatusIcon.className = 'api-status-icon set';
                                 apiKeyStatusText.textContent = 'API Key is set';
@@ -616,13 +1060,114 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                         }
 
                         function updatePrompt(promptValue) {
-                             promptTemplate.value = promptValue || ''; // Handle null/undefined
+                            promptTemplate.value = promptValue || '';
+                        }
+
+                        function updateTemplateList(templates) {
+                            currentTemplates = templates || {};
+                            templateList.innerHTML = '';
+                            
+                            if (Object.keys(currentTemplates).length === 0) {
+                                const emptyItem = document.createElement('div');
+                                emptyItem.className = 'template-item';
+                                emptyItem.textContent = 'No templates yet. Create one!';
+                                templateList.appendChild(emptyItem);
+                                return;
+                            }
+                            
+                            Object.entries(currentTemplates).forEach(([id, template]) => {
+                                const div = document.createElement('div');
+                                div.className = 'template-item';
+                                if (id === selectedTemplateId) {
+                                    div.classList.add('selected');
+                                }
+                                div.dataset.id = id;
+
+                                const nameSpan = document.createElement('span');
+                                nameSpan.className = 'template-name';
+                                nameSpan.textContent = template.name;
+                                nameSpan.title = template.name;
+                                div.appendChild(nameSpan);
+
+                                const actionsDiv = document.createElement('div');
+                                actionsDiv.className = 'template-actions';
+                                
+                                const useBtn = document.createElement('button');
+                                useBtn.innerHTML = '<span class="emoji-icon">✓</span>';
+                                useBtn.title = 'Use this template';
+                                useBtn.onclick = (e) => {
+                                    e.stopPropagation();
+                                    selectedTemplateId = id;
+                                    promptTemplate.value = template.prompt;
+                                    saveState();
+                                    updateTemplateList(currentTemplates);
+                                };
+                                
+                                const deleteBtn = document.createElement('button');
+                                deleteBtn.innerHTML = '<span class="emoji-icon">🗑️</span>';
+                                deleteBtn.title = 'Delete this template';
+                                deleteBtn.onclick = (e) => {
+                                    e.stopPropagation();
+                                    vscode.postMessage({ 
+                                        command: 'deleteTemplate',
+                                        value: id
+                                    });
+                                };
+
+                                actionsDiv.appendChild(useBtn);
+                                actionsDiv.appendChild(deleteBtn);
+                                div.appendChild(actionsDiv);
+                                
+                                // Make the whole item clickable to select template
+                                div.addEventListener('click', () => {
+                                    selectedTemplateId = id;
+                                    promptTemplate.value = template.prompt;
+                                    saveState();
+                                    updateTemplateList(currentTemplates);
+                                });
+                                
+                                templateList.appendChild(div);
+                            });
+                        }
+
+                        function toggleSection(sectionEl, sectionName) {
+                            const isCollapsed = sectionEl.classList.toggle('collapsed');
+                            const collapsedSections = previousState.collapsedSections || {};
+                            collapsedSections[sectionName] = isCollapsed;
+                            saveState();
+                        }
+
+                        function restoreCollapsedState() {
+                            const collapsedSections = previousState.collapsedSections || {};
+                            
+                            if (collapsedSections.apiKey) {
+                                apiKeyHeader.parentElement.classList.add('collapsed');
+                            }
+                            
+                            if (collapsedSections.model) {
+                                modelHeader.parentElement.classList.add('collapsed');
+                            }
+                            
+                            if (collapsedSections.templates) {
+                                templatesHeader.parentElement.classList.add('collapsed');
+                            }
                         }
 
                         function saveState() {
+                            const collapsedSections = {
+                                apiKey: apiKeyHeader.parentElement.classList.contains('collapsed'),
+                                model: modelHeader.parentElement.classList.contains('collapsed'),
+                                templates: templatesHeader.parentElement.classList.contains('collapsed')
+                            };
+                            
                             vscode.setState({
                                 hasApiKey: currentApiKeySet,
-                                prompt: promptTemplate.value
+                                prompt: promptTemplate.value,
+                                selectedModel: modelSelect.value,
+                                alwaysUseGenerated: alwaysUseGenerated.checked,
+                                templates: currentTemplates,
+                                selectedTemplateId,
+                                collapsedSections
                             });
                             console.log('Webview state saved.');
                         }
@@ -630,33 +1175,82 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                         // --- Event listeners ---
                         setApiKeyBtn.addEventListener('click', () => {
                             console.log('Set API Key button clicked');
-                            generateStatus.textContent = ''; // Clear status
+                            generateStatus.textContent = '';
                             vscode.postMessage({ command: 'setApiKey' });
                         });
 
                         generateBtn.addEventListener('click', () => {
-                             console.log('Generate button clicked');
-                             if (!generateBtn.disabled) {
-                                generateStatus.textContent = 'Generating...'; // Provide feedback
+                            console.log('Generate button clicked');
+                            if (!generateBtn.disabled) {
+                                generateStatus.textContent = 'Generating...';
                                 vscode.postMessage({ command: 'generateCommitMessage' });
-                             }
+                            }
                         });
 
                         savePromptBtn.addEventListener('click', () => {
                             console.log('Save Prompt button clicked');
-                            generateStatus.textContent = ''; // Clear status
+                            generateStatus.textContent = '';
                             vscode.postMessage({
                                 command: 'setPrompt',
                                 value: promptTemplate.value
                             });
                         });
 
-                        // Save state when textarea loses focus (optional, good for persistence)
+                        modelSelect.addEventListener('change', () => {
+                            console.log('Model selection changed');
+                            vscode.postMessage({
+                                command: 'setModel',
+                                value: modelSelect.value
+                            });
+                            saveState();
+                        });
+
+                        alwaysUseGenerated.addEventListener('change', () => {
+                            console.log('Always use generated changed');
+                            vscode.postMessage({
+                                command: 'setAlwaysUseGenerated',
+                                value: alwaysUseGenerated.checked
+                            });
+                            saveState();
+                        });
+
+                        newTemplateBtn.addEventListener('click', () => {
+                            console.log('New template button clicked');
+                            vscode.postMessage({ command: 'newTemplate' });
+                        });
+
+                        editTemplateBtn.addEventListener('click', () => {
+                            if (selectedTemplateId) {
+                                console.log('Edit template button clicked');
+                                vscode.postMessage({ 
+                                    command: 'editTemplate',
+                                    value: selectedTemplateId
+                                });
+                            } else {
+                                vscode.postMessage({ command: 'newTemplate' });
+                            }
+                        });
+
+                        historyBtn.addEventListener('click', () => {
+                            console.log('History button clicked');
+                            vscode.postMessage({ command: 'showCommitHistory' });
+                        });
+
+                        copyBtn.addEventListener('click', () => {
+                            console.log('Copy button clicked');
+                            vscode.postMessage({ command: 'copyLastCommitMessage' });
+                        });
+
                         promptTemplate.addEventListener('blur', saveState);
+                        
+                        // Collapsible section handlers
+                        apiKeyHeader.addEventListener('click', () => toggleSection(apiKeyHeader.parentElement, 'apiKey'));
+                        modelHeader.addEventListener('click', () => toggleSection(modelHeader.parentElement, 'model'));
+                        templatesHeader.addEventListener('click', () => toggleSection(templatesHeader.parentElement, 'templates'));
 
                         // --- Handle messages from extension ---
                         window.addEventListener('message', event => {
-                            const message = event.data; // The JSON data from the extension
+                            const message = event.data;
                             console.log('Webview received command:', message.command);
 
                             switch (message.command) {
@@ -664,38 +1258,155 @@ class CommitMessageViewProvider implements vscode.WebviewViewProvider {
                                     console.log('Updating UI from received settings:', message);
                                     updateApiKeyStatus(message.hasApiKey);
                                     updatePrompt(message.prompt);
-                                    generateStatus.textContent = ''; // Clear status on update
-                                    // Save received state
+                                    modelSelect.value = message.selectedModel || 'gemini-2.0-flash';
+                                    alwaysUseGenerated.checked = message.alwaysUseGenerated || false;
+                                    updateTemplateList(message.templates);
+                                    selectedTemplateId = message.selectedTemplateId;
+                                    generateStatus.textContent = '';
                                     currentApiKeySet = message.hasApiKey;
                                     saveState();
                                     break;
-                                // Add other message handlers if needed
+                                case 'clearGeneratingStatus':
+                                    generateStatus.textContent = '';
+                                    break;
                             }
                         });
 
-                         // --- Initialization ---
-                         console.log('Webview script initializing...');
-                         // Restore state immediately
-                         updateApiKeyStatus(previousState.hasApiKey);
-                         updatePrompt(previousState.prompt);
-                         // Request fresh state from the extension in case config changed while hidden
-                         console.log('Requesting initial settings from extension...');
-                         vscode.postMessage({ command: 'getInitialSettings' });
-
+                        // --- Initialization ---
+                        console.log('Webview script initializing...');
+                        updateApiKeyStatus(previousState.hasApiKey);
+                        updatePrompt(previousState.prompt);
+                        modelSelect.value = previousState.selectedModel;
+                        alwaysUseGenerated.checked = previousState.alwaysUseGenerated;
+                        updateTemplateList(previousState.templates);
+                        selectedTemplateId = previousState.selectedTemplateId;
+                        restoreCollapsedState();
+                        console.log('Requesting initial settings from extension...');
+                        vscode.postMessage({ command: 'getInitialSettings' });
 
                     } else {
                         console.error("acquireVsCodeApi is not available. Webview cannot communicate with the extension.");
-                        // Display error to user in the webview itself
                         document.body.innerHTML = '<div style="padding: 20px; color: var(--vscode-errorForeground);">Error: Cannot initialize communication with VS Code.</div>';
                     }
-                }()); // End IIFE
+                }());
             </script>
         </body>
         </html>`;
         console.log("-> HTML content generated.");
         return htmlContent;
     }
-} // End class CommitMessageViewProvider
+
+    private async _createNewTemplate() {
+        const name = await vscode.window.showInputBox({
+            prompt: "Enter a name for the new template",
+            placeHolder: "e.g., Conventional Commits",
+        });
+
+        if (!name) return; // User cancelled
+
+        const prompt = await vscode.window.showInputBox({
+            prompt: "Enter the prompt template",
+            placeHolder: "Enter your prompt template...",
+            value: getDefaultPrompt(),
+        });
+
+        if (!prompt) return; // User cancelled
+
+        const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
+        const templates = config.get<{ [key: string]: any }>('savedTemplates') || {};
+        const id = `template_${Date.now()}`;
+
+        templates[id] = {
+            name,
+            prompt,
+            projectPaths: []
+        };
+
+        try {
+            await config.update('savedTemplates', templates, vscode.ConfigurationTarget.Global);
+            this._updateWebviewSettings();
+            vscode.window.showInformationMessage(`Template "${name}" created successfully.`);
+        } catch (error: any) {
+            console.error("Error creating template:", error);
+            vscode.window.showErrorMessage(`Failed to create template: ${error.message}`);
+        }
+    }
+
+    private async _editTemplate(templateId: string) {
+        const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
+        const templates = config.get<{ [key: string]: any }>('savedTemplates') || {};
+        const template = templates[templateId];
+
+        if (!template) {
+            vscode.window.showErrorMessage("Template not found.");
+            return;
+        }
+
+        const name = await vscode.window.showInputBox({
+            prompt: "Edit template name",
+            value: template.name,
+        });
+
+        if (!name) return; // User cancelled
+
+        const prompt = await vscode.window.showInputBox({
+            prompt: "Edit prompt template",
+            value: template.prompt,
+        });
+
+        if (!prompt) return; // User cancelled
+
+        templates[templateId] = {
+            ...template,
+            name,
+            prompt
+        };
+
+        try {
+            await config.update('savedTemplates', templates, vscode.ConfigurationTarget.Global);
+            this._updateWebviewSettings();
+            vscode.window.showInformationMessage(`Template "${name}" updated successfully.`);
+        } catch (error: any) {
+            console.error("Error updating template:", error);
+            vscode.window.showErrorMessage(`Failed to update template: ${error.message}`);
+        }
+    }
+
+    private async _deleteTemplate(templateId: string) {
+        const config = vscode.workspace.getConfiguration('gitDiffCommitGenerator');
+        const templates = config.get<{ [key: string]: any }>('savedTemplates') || {};
+        
+        if (!templates[templateId]) {
+            vscode.window.showErrorMessage("Template not found.");
+            return;
+        }
+
+        const name = templates[templateId].name;
+        delete templates[templateId];
+
+        try {
+            await config.update('savedTemplates', templates, vscode.ConfigurationTarget.Global);
+            
+            // If this was the default template, clear that setting
+            const defaultTemplateId = config.get<string>('defaultTemplateId');
+            if (defaultTemplateId === templateId) {
+                await config.update('defaultTemplateId', '', vscode.ConfigurationTarget.Global);
+            }
+
+            this._updateWebviewSettings();
+            vscode.window.showInformationMessage(`Template "${name}" deleted successfully.`);
+        } catch (error: any) {
+            console.error("Error deleting template:", error);
+            vscode.window.showErrorMessage(`Failed to delete template: ${error.message}`);
+        }
+    }
+
+    public clearGeneratingStatus() {
+        if (this._view) {
+            this._view.webview.postMessage({ command: 'clearGeneratingStatus' });
+        }
+    }
+}
 
 // --- Helper to generate nonce ---
 function getNonce() {
